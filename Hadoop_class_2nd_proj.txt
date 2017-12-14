@@ -1,0 +1,241 @@
+﻿root
+hadoop
+su - hadoop
+cd source
+
+$ ../hadoop/bin/start-all.sh
+$ ../hadoop/bin/stop-mapred.sh
+-- 스팍 서비스 시작( Master/Worker )
+$ ../spark/bin/start-all.sh
+-- 샤크 리스너 시작( SharkServer )
+$ ../shark/bin/shark  --service  sharkserver  8083 & 
+-- 샤크 SQL 쉘 접속 
+$ ../shark/bin/shark   -h   localhost   -p   8083
+
+CREATE TABLE hw_movies_tmp
+( 
+  user STRING,
+  item STRING,
+  score INT,
+  time  INT
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t';
+ 
+LOAD DATA LOCAL INPATH 'u.data' 
+INTO TABLE hw_movies_tmp;
+
+CREATE TABLE hw_movies
+( 
+  user STRING,
+  item STRING,
+  time  INT
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t';
+
+INSERT OVERWRITE TABLE hw_movies
+SELECT user, item, time
+FROM hw_movies_tmp;
+
+--장바구니 수
+CREATE TABLE hw_basket_cnt AS
+select count(*) cnt
+from
+(
+SELECT user
+FROM hw_movies
+GROUP BY user
+HAVING count(*) < 100
+)T;
+
+CREATE TABLE hw_movies_new AS
+SELECT t.* 
+FROM hw_movies t
+JOIN
+(SELECT a.user
+   FROM hw_movies a
+  GROUP BY a.user
+ HAVING count(*) < 100) b
+WHERE t.user = b.user;
+
+CREATE TABLE hw_movies_two_count
+( 
+  item_a STRING,
+  item_b STRING,
+  counts INT 
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t';
+
+INSERT OVERWRITE TABLE hw_movies_two_count 
+SELECT t.item_a, t.item_b, count(*) as counts  
+FROM (
+  SELECT a.user as user, a.item item_a, b.item item_b
+  FROM hw_movies_new a
+  JOIN hw_movies_new b 
+    ON a.user=b.user
+ WHERE a.time < b.time
+   and a.item <> b.item
+) t
+GROUP BY t.item_a, t.item_b
+HAVING count(*) > 1;
+
+CREATE TABLE hw_movies_one_count
+( 
+  item STRING,
+  counts INT 
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t';
+
+INSERT OVERWRITE TABLE hw_movies_one_count
+SELECT item, count(*) 
+FROM hw_movies_new
+GROUP BY item;
+
+CREATE TABLE hw_movies_association
+(
+ item_a  int
+,item_b  int
+,n_ab    bigint
+,n_a     bigint
+,n_b     bigint
+,s_ab    double
+,s_a     double
+,s_b     double
+,confidence      double
+,lift    double
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ',';
+
+INSERT OVERWRITE TABLE hw_movies_association 
+SELECT t.item_a                as item_a, 
+       t.item_b                as item_b, 
+       SUM(t.n_ab)             as n_ab,
+       SUM(t.n_a )             as n_a, 
+       SUM(b.counts)           as n_b, 
+       SUM(t.n_ab/c.cnt)       as s_ab, 
+       SUM(t.n_a/c.cnt)        as s_a, 
+       SUM(b.counts/c.cnt)     as s_b, 
+       SUM((t.n_ab/c.cnt)/( t.n_a/c.cnt))                  as confidence,
+       SUM((t.n_ab/c.cnt)/((t.n_a/c.cnt)*(b.counts/c.cnt))) as lift
+FROM (
+   SELECT two.item_a as item_a, 
+          two.item_b as item_b,
+          SUM(two.counts) as n_ab,
+          SUM(one.counts) as n_a 
+  FROM hw_movies_two_count two
+  JOIN hw_movies_one_count one
+       ON two.item_a = one.item 
+  GROUP BY two.item_a, two.item_b
+) t
+JOIN hw_movies_one_count b
+     ON t.item_b=b.item
+JOIN hw_basket_cnt c
+GROUP By t.item_a, t.item_b;
+
+
+$ mysql   hivedb  -uhiveuser -phivepw
+mysql> show  tables;
+
+CREATE TABLE hw_movies_association
+(
+ item_a  int
+,item_b  int
+,n_ab    bigint(20)
+,n_a     bigint(20)
+,n_b     bigint(20)
+,s_ab    double
+,s_a     double
+,s_b     double
+,confidence      double
+,lift    double
+);
+
+mysql > quit;
+
+$ ../hadoop/bin/start-mapred.sh
+
+$ sqoop export --connect jdbc:mysql://localhost/hivedb --table hw_movies_association --username hiveuser -P   --export-dir /user/hive/warehouse/hw_movies_association  -m 1
+
+[NOTE] 비밀번호를 물어보면 hivepw 를 입력하세요.
+
+4.7 웹서비스 : APM / apache , php , mysql
+
+$ su  -
+$ apachectl  start
+
+웹브라우저 : http://192.168.56.101/hw_movies.php
+
+
+
+
+hw_movies.php
+
+<?php
+echo("
+<html>
+  <head>
+        <meta http-equiv='content-Type' content='text/html; charset=euc-kr'>
+        <title>ITEM RECOMMENDER</title>
+  </head>
+");
+$conn = mysql_connect( "localhost","hiveuser","hivepw" );
+        mysql_select_db( "hivedb" );
+
+$item_a = $_GET["item"];
+$orders = $_GET["orders"];
+$counts_min = $_GET["counts_min"];
+$counts_max = $_GET["counts_max"];
+if ( !$counts_min )
+$counts_min = 1;
+if ( !$counts_max )
+$counts_max = 100;
+if( $item_a ) {
+        $query  = "SELECT * FROM hw_movies_association ";
+        $query .= "WHERE  item_a=$item_a ";
+        $query .= "  AND  n_ab>=$counts_min ";
+        $query .= "  AND  n_ab<=$counts_max ";
+        $query .= "ORDER BY $orders desc ";
+        $query .= "LIMIT 10 ";
+        echo "<br>$query<br><br>";
+        echo(" INPUT ITEM : [$item_a]");
+        echo(" Counts_MIN : [$counts_min]");
+        echo(" Counts_MAX : [$counts_max]<br>");
+        echo("<table width=600>
+              <tr><td>Recommeded Item's</td>
+                  <td>Counts</td><td>Confidence</td><td>Lift</td>
+              </tr>");
+
+        $res = mysql_query( $query );
+        while( $row = mysql_fetch_array( $res ) ) {
+          echo("<tr><td>$row[item_b]</td>
+                    <td>$row[n_ab]</td>
+                    <td>".number_format($row[confidence],3)."</td>
+                    <td>".number_format($row[lift],3)."</td>
+                </tr>");
+        };
+        echo("</table>");
+};
+mysql_close( $conn );
+
+echo("
+  <body>
+  <br><br><br>
+  <form method='GET'>
+        ORDER BY :
+        <input type=radio name='orders' value='n_ab' checked>Counts
+        <input type=radio name='orders' value='confidence'>Confidence
+        <input type=radio name='orders' value='lift'>Lift
+        <br>
+        ITEM CODE :
+        <input type='text' name='item' value='$item_a' size=10>
+        Counts_MIN :
+        <input type='text' name='counts_min' value='$counts_min' size=10>
+        Counts_MAX :
+        <input type='text' name='counts_max' value='$counts_max' size=10>
+        <br>
+        <input type='submit' value='Find'>
+  </form>
+  <br><br><br>
+  </body>
+</html>
+");
+?>
